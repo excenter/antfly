@@ -245,6 +245,13 @@ pub const DenseSearchExecutor = struct {
         index_name: []const u8,
         doc_keys: []const []const u8,
     ) anyerror![]u64 = null,
+    lookup_vector_ids_for_text_doc_nums: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        text_index_name: []const u8,
+        dense_index_name: []const u8,
+        doc_nums: []const u32,
+    ) anyerror![]u64 = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1144,6 +1151,32 @@ fn collectStructuredFilterDocIdsAlloc(
     return try collectTextSearchQueryDocIdsAlloc(alloc, req, text_entry, search_query);
 }
 
+const ResolvedFilterDocNums = struct {
+    text_index_name: []const u8,
+    doc_nums: []const u32,
+};
+
+fn collectStructuredFilterDocNumsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: StructuredFilterResolverExecutor,
+    filter_query_json: []const u8,
+) !?ResolvedFilterDocNums {
+    const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
+    const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
+    const doc_nums = try collectTextSearchQueryDocNumsAlloc(alloc, req, text_entry, search_query);
+
+    return .{
+        .text_index_name = text_entry.config.name,
+        .doc_nums = doc_nums,
+    };
+}
+
 fn collectTextSearchQueryDocIdsAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -1189,6 +1222,19 @@ fn collectTextSearchQueryDocIdsAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+fn collectTextSearchQueryDocNumsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    text_entry: *index_manager_mod.IndexManager.TextIndex,
+    search_query: search_mod.SearchQuery,
+) ![]const u32 {
+    const snapshot = text_entry.persistent.snapshot();
+    var filter_arena = std.heap.ArenaAllocator.init(alloc);
+    defer filter_arena.deinit();
+    const filter = search_mod.searchQueryToFilterArena(filter_arena.allocator(), search_query) catch return try collectScoredTextSearchQueryDocNumsAlloc(alloc, req, text_entry, search_query);
+    return snapshot.executeFilter(alloc, filter) catch return try collectScoredTextSearchQueryDocNumsAlloc(alloc, req, text_entry, search_query);
+}
+
 fn collectScoredTextSearchQueryDocIdsAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -1216,6 +1262,29 @@ fn collectScoredTextSearchQueryDocIdsAlloc(
         try appendOwnedDocId(alloc, &out, id);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn collectScoredTextSearchQueryDocNumsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    text_entry: *index_manager_mod.IndexManager.TextIndex,
+    search_query: search_mod.SearchQuery,
+) ![]const u32 {
+    const snapshot = text_entry.persistent.snapshot();
+    const k: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
+    var result = try search_mod.execute(alloc, snapshot, .{
+        .query = search_query,
+        .k = k,
+        .offset = 0,
+        .include_stored = false,
+        .distributed_text_stats = req.distributed_text_stats,
+    });
+    defer result.deinit();
+
+    const out = try alloc.alloc(u32, result.hits.len);
+    errdefer alloc.free(out);
+    for (result.hits, 0..) |hit, i| out[i] = hit.doc_id;
+    return out;
 }
 
 fn resolveFilterTextIndexEntry(
@@ -1663,8 +1732,35 @@ fn deriveNativeDenseConstraintsAlloc(
         out.filter_ids = req.filter_ids;
     }
 
+    var doc_req = req;
+    var directly_resolved_stored_filters = false;
+    if (req.filter_query_json.len > 0) {
+        if (try collectStructuredFilterVectorIdsAlloc(alloc, req, executor, index_name, req.filter_query_json)) |mapped| {
+            directly_resolved_stored_filters = true;
+            doc_req.filter_query_json = "";
+            if (out.positive_filter) {
+                const intersected = try intersectVectorIdsAlloc(alloc, out.filter_ids, mapped);
+                alloc.free(mapped);
+                if (out.filter_ids_owned and out.filter_ids.len > 0) alloc.free(@constCast(out.filter_ids));
+                out.filter_ids = intersected;
+                out.filter_ids_owned = true;
+            } else {
+                out.filter_ids = mapped;
+                out.filter_ids_owned = true;
+                out.positive_filter = true;
+            }
+        }
+    }
+    if (req.exclusion_query_json.len > 0) {
+        if (try collectStructuredFilterVectorIdsAlloc(alloc, req, executor, index_name, req.exclusion_query_json)) |mapped_excludes| {
+            directly_resolved_stored_filters = true;
+            doc_req.exclusion_query_json = "";
+            try mergeNativeExcludeIds(alloc, &out, mapped_excludes, req.exclude_ids);
+        }
+    }
+
     const doc_start = if (profile_enabled) platform_time.monotonicNs() else 0;
-    var doc_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
+    var doc_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, doc_req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
     });
@@ -1699,7 +1795,8 @@ fn deriveNativeDenseConstraintsAlloc(
     if (out.exclude_ids.len == 0 and req.exclude_ids.len > 0) {
         out.exclude_ids = req.exclude_ids;
     }
-    out.resolved_stored_filters = doc_constraints.resolved_stored_filters;
+    out.resolved_stored_filters = doc_constraints.resolved_stored_filters or
+        (directly_resolved_stored_filters and doc_req.filter_query_json.len == 0 and doc_req.exclusion_query_json.len == 0);
     if (profile_enabled) {
         std.log.info(
             "antfly_bench_query_dense_constraints index={s} total_us={d} derive_doc_us={d} map_filter_us={d} map_exclude_us={d} filter_doc_ids={d} exclude_doc_ids={d} filter_vector_ids={d} exclude_vector_ids={d} positive_filter={} resolved_stored_filters={}",
@@ -1719,6 +1816,22 @@ fn deriveNativeDenseConstraintsAlloc(
         );
     }
     return out;
+}
+
+fn collectStructuredFilterVectorIdsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: DenseSearchExecutor,
+    dense_index_name: []const u8,
+    filter_query_json: []const u8,
+) !?[]u64 {
+    const lookup = executor.lookup_vector_ids_for_text_doc_nums orelse return null;
+    const resolved = (try collectStructuredFilterDocNumsAlloc(alloc, req, .{
+        .ctx = executor.ctx,
+        .text_index_entry = executor.text_index_entry,
+    }, filter_query_json)) orelse return null;
+    defer alloc.free(resolved.doc_nums);
+    return try lookup(executor.ctx, alloc, resolved.text_index_name, dense_index_name, resolved.doc_nums);
 }
 
 fn mergeNativeExcludeIds(

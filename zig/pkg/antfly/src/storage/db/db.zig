@@ -8019,6 +8019,7 @@ pub const DB = struct {
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
             .lookup_vector_ids = denseVectorIdsCallback,
+            .lookup_vector_ids_for_text_doc_nums = denseVectorIdsForTextDocNumsCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -8042,6 +8043,7 @@ pub const DB = struct {
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
             .lookup_vector_ids = denseVectorIdsCallback,
+            .lookup_vector_ids_for_text_doc_nums = denseVectorIdsForTextDocNumsCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -8318,6 +8320,17 @@ pub const DB = struct {
     ) anyerror![]u64 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.index_manager.lookupDenseVectorIdsAlloc(alloc, self.core.store, index_name, doc_keys);
+    }
+
+    fn denseVectorIdsForTextDocNumsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        text_index_name: []const u8,
+        dense_index_name: []const u8,
+        doc_nums: []const u32,
+    ) anyerror![]u64 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.lookupDenseVectorIdsForTextDocNumsAlloc(alloc, text_index_name, dense_index_name, doc_nums);
     }
 
     fn sparseIndexCallback(

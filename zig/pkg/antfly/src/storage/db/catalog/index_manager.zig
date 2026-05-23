@@ -5872,6 +5872,20 @@ pub const IndexManager = struct {
         return try out.toOwnedSlice(alloc);
     }
 
+    pub fn lookupDenseVectorIdsForTextDocNumsAlloc(self: *IndexManager, alloc: Allocator, text_index_name: []const u8, dense_index_name: []const u8, doc_nums: []const u32) ![]u64 {
+        _ = self.denseIndex(dense_index_name) orelse return &.{};
+        const text_entry = self.textIndexEntry(text_index_name) orelse return &.{};
+        const snapshot = text_entry.persistent.snapshot();
+
+        var out = std.ArrayListUnmanaged(u64).empty;
+        errdefer out.deinit(alloc);
+        for (doc_nums) |doc_num| {
+            const stored = snapshot.storedDoc(doc_num) orelse continue;
+            try out.append(alloc, deterministicDenseVectorId(stored.id));
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
     fn lookupDenseVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !?u64 {
         var mutable_txn = txn;
         const key = try denseDocMappingKey(self.alloc, index_name, doc_key);
