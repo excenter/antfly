@@ -8871,18 +8871,19 @@ pub const DB = struct {
             if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.exclusion_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
                 defer owned_set.deinit(&entry.index);
-                if (owned_set.include) |ids| {
-                    const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
-                    entry.index.freeDocIds(exclude_doc_ids);
-                    exclude_doc_ids = merged;
-                    changed = true;
+                if (!(try applyAlgebraicDocIdSetExclusionAlloc(
+                    &entry.index,
+                    &filter_doc_ids,
+                    &filter_supported,
+                    &exclude_doc_ids,
+                    owned_set,
+                ))) {
+                    entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+                    self.recordUnsupportedDocSetFilterShape();
+                    if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
+                    return .{ .req = req };
                 }
-                if (owned_set.exclude.len > 0) {
-                    const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, owned_set.exclude);
-                    entry.index.freeDocIds(exclude_doc_ids);
-                    exclude_doc_ids = merged;
-                    changed = true;
-                }
+                changed = true;
                 exclusion_json_resolved = true;
             }
         }
@@ -9005,11 +9006,7 @@ pub const DB = struct {
             };
             defer exclusion.deinit(index.alloc);
 
-            if (!(try unionResolvedFilterExcludeAlloc(index.alloc, &filter, &exclusion.include))) {
-                filter.deinit(index.alloc);
-                return null;
-            }
-            if (!(try unionResolvedFilterExcludeAlloc(index.alloc, &filter, &exclusion.exclude))) {
+            if (!(try applyResolvedFilterExclusionAlloc(index.alloc, &filter, &exclusion))) {
                 filter.deinit(index.alloc);
                 return null;
             }
@@ -9154,6 +9151,23 @@ pub const DB = struct {
         return true;
     }
 
+    fn applyResolvedFilterExclusionAlloc(
+        alloc: Allocator,
+        target: *doc_set.ResolvedDocFilter,
+        exclusion_filter: *const doc_set.ResolvedDocFilter,
+    ) !bool {
+        if (try doc_set.differenceAlloc(alloc, &exclusion_filter.include, &exclusion_filter.exclude)) |matched| {
+            var owned_matched = matched;
+            defer owned_matched.deinit(alloc);
+            return try unionResolvedFilterExcludeAlloc(alloc, target, &owned_matched);
+        }
+
+        switch (exclusion_filter.include) {
+            .all => return try intersectResolvedFilterIncludeAlloc(alloc, target, &exclusion_filter.exclude),
+            else => return false,
+        }
+    }
+
     fn resolvedDocSetStatCount(set: *const doc_set.ResolvedDocSet) usize {
         return set.estimatedCardinality() orelse 0;
     }
@@ -9230,6 +9244,19 @@ pub const DB = struct {
         return try out.toOwnedSlice(alloc);
     }
 
+    fn differenceAlgebraicDocIds(alloc: Allocator, left: []const []const u8, right: []const []const u8) ![][]u8 {
+        var out = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (out.items) |item| alloc.free(item);
+            out.deinit(alloc);
+        }
+        for (left) |doc_id| {
+            if (containsAlgebraicDocId(right, doc_id)) continue;
+            try out.append(alloc, try alloc.dupe(u8, doc_id));
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
     fn unionAlgebraicDocIds(alloc: Allocator, left: []const []const u8, right: []const []const u8) ![][]u8 {
         var out = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
@@ -9242,6 +9269,40 @@ pub const DB = struct {
             try out.append(alloc, try alloc.dupe(u8, doc_id));
         }
         return try out.toOwnedSlice(alloc);
+    }
+
+    fn applyAlgebraicDocIdSetExclusionAlloc(
+        index: *@import("algebraic/index.zig").Index,
+        filter_doc_ids: *[][]u8,
+        filter_supported: *bool,
+        exclude_doc_ids: *[][]u8,
+        exclusion: @import("algebraic/index.zig").Index.FilterDocIdSet,
+    ) !bool {
+        if (exclusion.include) |include_ids| {
+            const matched = try differenceAlgebraicDocIds(index.alloc, include_ids, exclusion.exclude);
+            defer index.freeDocIds(matched);
+            const merged = try unionAlgebraicDocIds(index.alloc, exclude_doc_ids.*, matched);
+            index.freeDocIds(exclude_doc_ids.*);
+            exclude_doc_ids.* = merged;
+            return true;
+        }
+
+        if (exclusion.exclude.len == 0) {
+            index.freeDocIds(filter_doc_ids.*);
+            filter_doc_ids.* = &.{};
+            filter_supported.* = true;
+            return true;
+        }
+
+        if (filter_supported.*) {
+            const intersected = try intersectAlgebraicDocIds(index.alloc, filter_doc_ids.*, exclusion.exclude);
+            index.freeDocIds(filter_doc_ids.*);
+            filter_doc_ids.* = intersected;
+        } else {
+            filter_doc_ids.* = try dupeAlgebraicDocIds(index.alloc, exclusion.exclude);
+            filter_supported.* = true;
+        }
+        return true;
     }
 
     fn denseQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
@@ -20131,6 +20192,18 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
     try std.testing.expectEqual(@as(u32, 1), sparse_required_plus_optional_should.total_hits);
     try std.testing.expectEqual(@as(usize, 1), sparse_required_plus_optional_should.hits.len);
     try std.testing.expectEqualStrings("doc:b", sparse_required_plus_optional_should.hits[0].id);
+
+    var dense_exclude_non_reject = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 2,
+        .include_stored = false,
+        .exclusion_query_json = "{\"bool\":{\"must_not\":[{\"term\":{\"category\":\"reject\"}}]}}",
+        .require_algebraic_filter_resolution = true,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 2 });
+    defer dense_exclude_non_reject.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_exclude_non_reject.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_exclude_non_reject.result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", dense_exclude_non_reject.result.hits[0].id);
 }
 
 test "db vector symbolic filters fail closed when algebraic lifecycle is stale" {
