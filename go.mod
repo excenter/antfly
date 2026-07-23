@@ -17,7 +17,7 @@ replace github.com/danaugrs/go-tsne => github.com/danaugrs/go-tsne/tsne v0.0.0-2
 
 replace (
 	github.com/blevesearch/bleve/v2 => github.com/excenter/bleve/v2 v2.5.8-antfly007
-	github.com/blevesearch/zapx/v17 => github.com/excenter/zapx/v17 v17.0.2-antfly005.vm1
+	github.com/blevesearch/zapx/v17 => github.com/excenter/zapx/v17 v17.0.2-antfly005.vm2
 )
 
 replace github.com/tidwall/wal => github.com/ajroetker/wal v0.0.0-antfly000

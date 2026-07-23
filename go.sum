@@ -521,8 +521,8 @@ github.com/evanphx/json-patch/v5 v5.9.11 h1:/8HVnzMq13/3x9TPvjG08wUGqBTmZBsCWzjT
 github.com/evanphx/json-patch/v5 v5.9.11/go.mod h1:3j+LviiESTElxA4p3EMKAB9HXj3/XEtnUf6OZxqIQTM=
 github.com/excenter/bleve/v2 v2.5.8-antfly007 h1:iy4EDlvnA8AnNafXkOAt73QD2N/kfv3ozBXSGyAXby8=
 github.com/excenter/bleve/v2 v2.5.8-antfly007/go.mod h1:nnAd/6gGfLQXE5MBwd6sbX+HwI4xVRFQsWiskvnnbBU=
-github.com/excenter/zapx/v17 v17.0.2-antfly005.vm1 h1:B6pxb5IIU1RpY3xYupGWPe9ethF2LmiS6BquBJi6Y/k=
-github.com/excenter/zapx/v17 v17.0.2-antfly005.vm1/go.mod h1:BIWKP0dHMgBVdFUSOsMCGrf+amY4L+ihYDEhNbLsVaQ=
+github.com/excenter/zapx/v17 v17.0.2-antfly005.vm2 h1:hUj/BMbm988FL2Hwuvcclvfm2RjVvG/tSOM46HscRb0=
+github.com/excenter/zapx/v17 v17.0.2-antfly005.vm2/go.mod h1:BIWKP0dHMgBVdFUSOsMCGrf+amY4L+ihYDEhNbLsVaQ=
 github.com/fatih/color v1.18.0 h1:S8gINlzdQ840/4pfAwic/ZE0djQEH3wM94VfqLTZcOM=
 github.com/fatih/color v1.18.0/go.mod h1:4FelSpRwEGDpQ12mAdzqdOukCy4u8WUtOY6lkT/6HfU=
 github.com/fatih/set v0.2.1 h1:nn2CaJyknWE/6txyUDGwysr3G5QC6xWB/PtVjPBbeaA=

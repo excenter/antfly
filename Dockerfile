@@ -37,12 +37,6 @@ COPY --from=builder /app/antfly /antfly
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD wget -qO- http://localhost:4200/readyz || exit 1
 
-# go-highway's NEON StreamVByte kernel drops the tail (<=15 bytes) of every
-# decoded column because zapx ignores the decoder's consumed-bytes return —
-# on arm64 this silently zeroes trailing location values and merges bake the
-# loss into new segments. Force the scalar path until zapx handles the tail.
-ENV HWY_NO_SIMD=1
-
 # Run as non-root
 USER antfly
 
