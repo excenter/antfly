@@ -6368,6 +6368,7 @@ pub fn build(b: *std.Build) void {
             "replica root reconcile enqueues newly admitted managed full text repair",
             "managed repair visibility edges retire cached readers and runtime status",
             "table runtime snapshot cache invalidation fences a stale observed publisher",
+            "table runtime snapshot cache group invalidation is scoped and fences stale publishers",
             "runtime status hook orders completed observation without crossing invalidation",
             "structural repair publication advances the table lifecycle epoch",
             "table runtime snapshot cache live publication does not starve structural refresh",

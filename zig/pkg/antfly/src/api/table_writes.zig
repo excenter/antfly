@@ -2312,6 +2312,19 @@ pub const ProvisionedTableWriteCache = struct {
         }
     }
 
+    fn invalidateGroup(self: *ProvisionedTableWriteCache, group_id: u64) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.group_id != group_id) {
+                i += 1;
+                continue;
+            }
+            _ = self.entries.orderedRemove(i);
+            self.retireEntryLocked(entry);
+        }
+    }
+
     fn retireDbEntriesForTableLocked(self: *ProvisionedTableWriteCache, table_name: []const u8) !void {
         var matching_entries: usize = 0;
         for (self.entries.items) |entry| {
@@ -3147,13 +3160,22 @@ pub const ProvisionedTableWriteCache = struct {
 
     fn releaseEntry(self: *ProvisionedTableWriteCache, entry: *Entry) void {
         lockAtomic(&self.entry_lifecycle_mutex);
-        defer self.entry_lifecycle_mutex.unlock();
         std.debug.assert(entry.active_leases > 0);
         entry.active_leases -= 1;
+        var drain_group_id: ?u64 = null;
         if (entry.active_leases == 0 and entry.retired) {
             self.queueRetiredEntryForCloseLocked(entry) catch |err| {
                 std.log.err("failed to queue retired writer-cache entry for close: {}", .{err});
             };
+            drain_group_id = entry.group_id;
+        }
+        self.entry_lifecycle_mutex.unlock();
+
+        if (drain_group_id) |group_id| {
+            if (self.open_mutex.tryLock()) {
+                defer self.open_mutex.unlock();
+                self.drainPendingClosesForGroupAssumeOpenMutexHeld(group_id);
+            }
         }
     }
 
@@ -3243,6 +3265,45 @@ pub const ProvisionedTableWriteCache = struct {
         lockAtomic(&self.open_mutex);
         defer self.open_mutex.unlock();
         self.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+    }
+
+    fn drainPendingClosesForGroupAssumeOpenMutexHeld(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+    ) void {
+        while (true) {
+            var entry_to_close: ?*Entry = null;
+            lockAtomic(&self.entry_lifecycle_mutex);
+            var i: usize = 0;
+            while (i < self.retired_entries.items.len) : (i += 1) {
+                const entry = self.retired_entries.items[i];
+                if (entry.group_id != group_id or entry.active_leases != 0) continue;
+                entry_to_close = self.retired_entries.orderedRemove(i);
+                break;
+            }
+            if (entry_to_close == null) {
+                i = 0;
+                while (i < self.closing_entries.items.len) : (i += 1) {
+                    const entry = self.closing_entries.items[i];
+                    if (entry.group_id != group_id) continue;
+                    entry_to_close = self.closing_entries.orderedRemove(i);
+                    break;
+                }
+            }
+            self.entry_lifecycle_mutex.unlock();
+
+            const entry = entry_to_close orelse return;
+            self.closeEntryNow(entry);
+        }
+    }
+
+    fn drainPendingClosesForGroup(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+    ) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        self.drainPendingClosesForGroupAssumeOpenMutexHeld(group_id);
     }
 
     fn drainPendingClosesAssumeOpenMutexHeld(self: *ProvisionedTableWriteCache) void {
@@ -5453,6 +5514,9 @@ pub const ProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     local_db_mutex: SourceStateMutex = .{},
+    group_lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    group_lifecycle_enabled: bool = false,
+    active_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     table_activity_threaded: Io.Threaded,
     table_activity_mutex: Io.Mutex = .init,
     table_activity_ready: Io.Condition = .init,
@@ -6195,6 +6259,10 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn deinit(self: *ProvisionedTableWriteSource) void {
         self.quiesce();
+        lockAtomic(&self.group_lifecycle_mutex);
+        self.active_groups.deinit(std.heap.page_allocator);
+        self.active_groups = .empty;
+        self.group_lifecycle_mutex.unlock();
         lockAtomic(&self.dirty_write_tables_mutex);
         self.clearAllDirtyWriteTablesLocked();
         self.dirty_write_tables.deinit(std.heap.page_allocator);
@@ -8537,6 +8605,44 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn setLocalIndexRepairDebtHook(self: *ProvisionedTableWriteSource, hook: ?LocalIndexRepairDebtHook) void {
         self.local_index_repair_debt_hook = hook;
+    }
+
+    pub fn activateGroup(self: *ProvisionedTableWriteSource, group_id: u64) !void {
+        lockAtomic(&self.group_lifecycle_mutex);
+        defer self.group_lifecycle_mutex.unlock();
+        try self.active_groups.put(std.heap.page_allocator, group_id, {});
+        self.group_lifecycle_enabled = true;
+    }
+
+    fn isGroupActive(self: *ProvisionedTableWriteSource, group_id: u64) bool {
+        lockAtomic(&self.group_lifecycle_mutex);
+        defer self.group_lifecycle_mutex.unlock();
+        return !self.group_lifecycle_enabled or self.active_groups.contains(group_id);
+    }
+
+    fn groupIsActive(ptr: *anyopaque, group_id: u64) bool {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.isGroupActive(group_id);
+    }
+
+    pub fn groupAdmissionSource(self: *ProvisionedTableWriteSource) table_reads.GroupAdmissionSource {
+        return .{ .ptr = self, .is_active = groupIsActive };
+    }
+
+    pub fn retireGroup(self: *ProvisionedTableWriteSource, group_id: u64) void {
+        lockAtomic(&self.group_lifecycle_mutex);
+        if (self.group_lifecycle_enabled) _ = self.active_groups.remove(group_id);
+        self.group_lifecycle_mutex.unlock();
+
+        lockAtomic(&self.local_db_mutex);
+        if (self.write_cache) |cache| cache.invalidateGroup(group_id);
+        if (self.startup_write_cache) |cache| cache.invalidateGroup(group_id);
+        self.local_db_mutex.unlock();
+
+        if (self.read_cache) |cache| cache.invalidateGroup(group_id);
+        if (self.runtime_status_cache) |cache| cache.invalidateGroup(group_id);
+        if (self.write_cache) |cache| cache.drainPendingClosesForGroup(group_id);
+        if (self.startup_write_cache) |cache| cache.drainPendingClosesForGroup(group_id);
     }
 
     fn invalidateReadCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -11516,6 +11622,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.local_write_owner) |owner| {
             return try leaseResidentDb(owner, alloc, table_name, group_id, lsm_root_generation, options);
         }
+        if (!self.isGroupActive(group_id)) return error.UnknownGroup;
         var read_request_active = !options.read_activity_held;
         if (read_request_active) self.beginReadRequest(table_name);
         errdefer if (read_request_active) self.endReadRequest(table_name);
@@ -11592,6 +11699,7 @@ pub const ProvisionedTableWriteSource = struct {
                 lsm_root_generation,
             );
         }
+        if (!self.isGroupActive(group_id)) return error.UnknownGroup;
 
         // This method is deliberately admission-free. Waiting on cache open
         // barriers is safe here because no read lease can participate in the

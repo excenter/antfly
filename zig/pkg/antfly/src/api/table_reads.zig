@@ -261,6 +261,15 @@ pub const ObservedDynamicFieldCapabilitySet = table_read_source.ObservedDynamicF
 pub const DynamicFieldObservationQuery = table_read_source.DynamicFieldObservationQuery;
 pub const ParsedTextStatsHttpResponse = table_read_source.ParsedTextStatsHttpResponse;
 
+pub const GroupAdmissionSource = struct {
+    ptr: *anyopaque,
+    is_active: *const fn (ptr: *anyopaque, group_id: u64) bool,
+
+    pub fn isActive(self: @This(), group_id: u64) bool {
+        return self.is_active(self.ptr, group_id);
+    }
+};
+
 pub const testing = if (builtin.is_test) struct {
     pub fn encodeRemoteQueryRequestAlloc(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
         return try encodeQueryRequest(alloc, req);
@@ -308,6 +317,7 @@ pub const ProvisionedTableReadCache = struct {
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    group_admission: ?GroupAdmissionSource = null,
     hit_count: std.atomic.Value(u64) = .init(0),
     miss_count: std.atomic.Value(u64) = .init(0),
     mutex: Io.Mutex = .init,
@@ -325,6 +335,7 @@ pub const ProvisionedTableReadCache = struct {
     // flight and nothing read the old epoch. Slots are never removed: one
     // u64 + the name per distinct table ever read through this cache.
     table_epochs: std.StringHashMapUnmanaged(u64) = .empty,
+    group_epochs: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     exclusive_table_access: std.StringHashMapUnmanaged(usize) = .empty,
     exclusive_group_access: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
@@ -356,6 +367,16 @@ pub const ProvisionedTableReadCache = struct {
     /// this table, so there is no in-flight epoch comparison to invalidate.
     fn bumpEpochLocked(self: *ProvisionedTableReadCache, table_name: []const u8) void {
         if (self.table_epochs.getPtr(table_name)) |epoch| epoch.* +%= 1;
+    }
+
+    fn epochForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) !u64 {
+        const gop = try self.group_epochs.getOrPut(self.alloc, group_id);
+        if (!gop.found_existing) gop.value_ptr.* = 1;
+        return gop.value_ptr.*;
+    }
+
+    fn bumpGroupEpochLocked(self: *ProvisionedTableReadCache, group_id: u64) void {
+        if (self.group_epochs.getPtr(group_id)) |epoch| epoch.* +%= 1;
     }
 
     pub const CacheStats = struct {
@@ -451,6 +472,7 @@ pub const ProvisionedTableReadCache = struct {
         var epoch_keys = self.table_epochs.keyIterator();
         while (epoch_keys.next()) |key| self.alloc.free(key.*);
         self.table_epochs.deinit(self.alloc);
+        self.group_epochs.deinit(self.alloc);
         var exclusive_keys = self.exclusive_table_access.keyIterator();
         while (exclusive_keys.next()) |key| self.alloc.free(key.*);
         self.exclusive_table_access.deinit(self.alloc);
@@ -490,6 +512,9 @@ pub const ProvisionedTableReadCache = struct {
         var pending_open_wait_started_ns: u64 = 0;
         var exclusive_wait_started_ns: u64 = 0;
         while (true) {
+            if (self.group_admission) |admission| {
+                if (!admission.isActive(group_id)) return error.UnknownGroup;
+            }
             // Reloaded every attempt: a stale-epoch retry usually means the
             // table was dropped/recreated or moved mid-open, which changes
             // the identity namespace — retrying with the first attempt's
@@ -507,6 +532,10 @@ pub const ProvisionedTableReadCache = struct {
             }
             exclusive_wait_started_ns = 0;
             const open_table_epoch = self.epochForTableLocked(table_name) catch |err| {
+                self.mutex.unlock(io);
+                return err;
+            };
+            const open_group_epoch = self.epochForGroupLocked(group_id) catch |err| {
                 self.mutex.unlock(io);
                 return err;
             };
@@ -565,6 +594,7 @@ pub const ProvisionedTableReadCache = struct {
             self.mutex.lockUncancelable(io);
             self.removePendingOpenForNamespaceLocked(group_id, identity_namespace, table_name);
             if ((self.table_epochs.get(table_name) orelse open_table_epoch +% 1) != open_table_epoch or
+                (self.group_epochs.get(group_id) orelse open_group_epoch +% 1) != open_group_epoch or
                 self.hasExclusiveGroupAccessLocked(group_id))
             {
                 // The table or exact group was invalidated while this DB was
@@ -640,6 +670,9 @@ pub const ProvisionedTableReadCache = struct {
         identity_namespace: ?db_mod.DocIdentityNamespace,
         table_name: []const u8,
     ) ?Lease {
+        if (self.group_admission) |admission| {
+            if (!admission.isActive(group_id)) return null;
+        }
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         if (self.findEntryForNamespaceLocked(group_id, lsm_root_generation, identity_namespace, table_name)) |entry| {
@@ -729,6 +762,7 @@ pub const ProvisionedTableReadCache = struct {
         } else {
             gop.value_ptr.* = 1;
         }
+        self.bumpGroupEpochLocked(group_id);
         self.removeEntriesForGroupLocked(group_id);
         self.ready.broadcast(io);
 
@@ -757,6 +791,15 @@ pub const ProvisionedTableReadCache = struct {
         self.ready.broadcast(io);
     }
 
+    pub fn invalidateGroup(self: *ProvisionedTableReadCache, group_id: u64) void {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.bumpGroupEpochLocked(group_id);
+        self.removeEntriesForGroupLocked(group_id);
+        self.ready.broadcast(io);
+    }
+
     pub fn snapshotRuntimeStatuses(
         self: *ProvisionedTableReadCache,
         alloc: std.mem.Allocator,
@@ -774,6 +817,8 @@ pub const ProvisionedTableReadCache = struct {
         defer self.mutex.unlock(io);
         var epochs = self.table_epochs.valueIterator();
         while (epochs.next()) |epoch| epoch.* +%= 1;
+        var group_epochs = self.group_epochs.valueIterator();
+        while (group_epochs.next()) |epoch| epoch.* +%= 1;
         for (self.entries.items) |entry| self.retireEntryLocked(entry);
         self.entries.clearRetainingCapacity();
         self.ready.broadcast(io);
@@ -26718,6 +26763,7 @@ test "provisioned read cache group exclusive drains only the published group" {
     var lease_two = try cache.getOrOpen(path_two, FakeCatalog.iface(), 7002, 1, "docs");
     defer lease_two.release();
     const table_epoch = cache.table_epochs.get("docs").?;
+    const group_epoch = cache.group_epochs.get(7001).?;
 
     var ctx = ExclusiveThread{ .cache = &cache };
     const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});
@@ -26738,6 +26784,7 @@ test "provisioned read cache group exclusive drains only the published group" {
     if (ctx.err) |err| return err;
     try std.testing.expect(observed);
     try std.testing.expectEqual(table_epoch, cache.table_epochs.get("docs").?);
+    try std.testing.expectEqual(group_epoch +% 1, cache.group_epochs.get(7001).?);
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 7002), cache.entries.items[0].group_id);
 }
