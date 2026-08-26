@@ -521,6 +521,12 @@ pub const ProvisionedTableReadCache = struct {
             // namespace would open (and cache) the wrong identity.
             const identity_namespace = try requireTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
             self.mutex.lockUncancelable(io);
+            if (self.group_admission) |admission| {
+                if (!admission.isActive(group_id)) {
+                    self.mutex.unlock(io);
+                    return error.UnknownGroup;
+                }
+            }
             if (self.hasExclusiveTableAccessLocked(table_name) or self.hasExclusiveGroupAccessLocked(group_id)) {
                 self.mutex.unlock(io);
                 const now_ns = platform_time.monotonicNs();
@@ -593,6 +599,15 @@ pub const ProvisionedTableReadCache = struct {
 
             self.mutex.lockUncancelable(io);
             self.removePendingOpenForNamespaceLocked(group_id, identity_namespace, table_name);
+            const group_inactive = if (self.group_admission) |admission|
+                !admission.isActive(group_id)
+            else
+                false;
+            if (group_inactive) {
+                self.ready.broadcast(io);
+                self.mutex.unlock(io);
+                return error.UnknownGroup;
+            }
             if ((self.table_epochs.get(table_name) orelse open_table_epoch +% 1) != open_table_epoch or
                 (self.group_epochs.get(group_id) orelse open_group_epoch +% 1) != open_group_epoch or
                 self.hasExclusiveGroupAccessLocked(group_id))
@@ -675,6 +690,12 @@ pub const ProvisionedTableReadCache = struct {
         }
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
+        if (self.group_admission) |admission| {
+            if (!admission.isActive(group_id)) {
+                self.mutex.unlock(io);
+                return null;
+            }
+        }
         if (self.findEntryForNamespaceLocked(group_id, lsm_root_generation, identity_namespace, table_name)) |entry| {
             entry.active_leases += 1;
             _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -26787,6 +26808,90 @@ test "provisioned read cache group exclusive drains only the published group" {
     try std.testing.expectEqual(group_epoch +% 1, cache.group_epochs.get(7001).?);
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 7002), cache.entries.items[0].group_id);
+}
+
+test "provisioned read cache rechecks group admission across open and lease publication" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-read-cache-group-admission";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .indexes_json = @import("tables.zig").default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .range_id = 7101,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Admission = struct {
+        calls: usize = 0,
+        reject_on_call: usize,
+
+        fn source(self: *@This()) GroupAdmissionSource {
+            return .{ .ptr = self, .is_active = isActive };
+        }
+
+        fn isActive(ptr: *anyopaque, _: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.calls < self.reject_on_call;
+        }
+    };
+
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+
+    var admission = Admission{ .reject_on_call = 2 };
+    cache.group_admission = admission.source();
+    try std.testing.expectError(
+        error.UnknownGroup,
+        cache.getOrOpen(path, FakeCatalog.iface(), 7001, 1, "docs"),
+    );
+    try std.testing.expectEqual(@as(usize, 2), admission.calls);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+
+    admission = .{ .reject_on_call = 3 };
+    cache.group_admission = admission.source();
+    try std.testing.expectError(
+        error.UnknownGroup,
+        cache.getOrOpen(path, FakeCatalog.iface(), 7001, 1, "docs"),
+    );
+    try std.testing.expectEqual(@as(usize, 3), admission.calls);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.pending_opens.items.len);
 }
 
 test "provisioned read cache retirement is allocation-free after entry installation" {
