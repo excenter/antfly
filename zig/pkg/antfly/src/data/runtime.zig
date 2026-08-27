@@ -4565,6 +4565,10 @@ fn restoreProgressNeedsPublication(
     return !antfly.metadata.table_manager.restoreProgressEquivalent(existing, local);
 }
 
+fn restoreProgressNeedsLocalRepair(progress: antfly.metadata.table_manager.RestoreProgressRecord) bool {
+    return progress.primary_restored and !progress.runtime_repair_complete;
+}
+
 fn restoreProgressMatchesActiveLocalIntent(
     local_node_id: u64,
     local_group_ids: []const u64,
@@ -4629,6 +4633,16 @@ test "data restore progress publishes only absent or changed state" {
     repairing.runtime_repair_complete = false;
     repairing.phase = "repairing";
     try std.testing.expect(restoreProgressNeedsPublication(&.{repairing}, complete));
+    try std.testing.expect(restoreProgressNeedsLocalRepair(repairing));
+
+    var primary_pending = repairing;
+    primary_pending.primary_restored = false;
+    try std.testing.expect(!restoreProgressNeedsLocalRepair(primary_pending));
+    try std.testing.expect(!restoreProgressNeedsLocalRepair(complete));
+
+    var retrying = repairing;
+    retrying.last_error = "transient";
+    try std.testing.expect(restoreProgressNeedsLocalRepair(retrying));
 
     const local_group_ids = [_]u64{70};
     const active_ranges = [_]antfly.metadata.table_manager.RangeRecord{.{
@@ -7899,6 +7913,16 @@ pub const DataServer = struct {
                 if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
+                const admission_cancellation: antfly.db.types.CancellationToken = if (route.cancellation) |cancellation| cancellation.token() else .none;
+                admission_source.preflightReplicatedWriteAdmission(
+                    group_id,
+                    table_name,
+                    req,
+                    admission_cancellation,
+                    deadline_ns,
+                ) catch |err| return dataRaftPreproposalAdmissionError(err);
+                ensureDataRaftBatchRouteActive(route) catch |err| return dataRaftPreproposalAdmissionError(err);
+                if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
             }
 
             var target_index: ?u64 = null;
@@ -7921,6 +7945,8 @@ pub const DataServer = struct {
                         // proposing a batch that skipped pressure admission.
                         retry_for_leader_preflight = true;
                     } else {
+                        ensureDataRaftBatchRouteActive(route) catch |err| return dataRaftPreproposalAdmissionError(err);
+                        if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                         const status = raft.host.http_host.host.raftStatus(group_id) orelse
                             return error.RaftBatchWriteOutcomeUnknown;
                         // Recheck the shared state while proposal ordering is
@@ -8389,6 +8415,17 @@ pub const DataServer = struct {
         if (route.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
+    }
+
+    fn dataRaftPreproposalAdmissionError(err: anyerror) anyerror {
+        return switch (err) {
+            error.Cancelled,
+            error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout,
+            error.AsyncWorkerFailed,
+            => error.LeaderUnavailable,
+            else => err,
+        };
     }
 
     fn dataRaftLocalCampaignGraceNs(leader_wait_ns: u64) u64 {
@@ -14558,6 +14595,11 @@ pub const DataServer = struct {
         }
 
         for (local_progress) |record| {
+            if (restoreProgressNeedsLocalRepair(record)) {
+                if (findTableById(tables, record.table_id)) |table| {
+                    _ = self.liveRuntimeWriteSource().requestRestoreRepairCatchUp(table.name, record.group_id);
+                }
+            }
             if (!restoreProgressNeedsPublication(projected_progress, record)) continue;
             try remote_metadata.upsertRestoreProgress(record);
         }
@@ -14892,6 +14934,9 @@ const PlacementTopologyIndex = struct {
                 .planned, .bootstrapping, .replaying => try appendUniqueNodeId(alloc, &group.transition_learners, intent.record.local_node_id),
                 .retiring => {},
             }
+            if (intent.record.backup_restore_bootstrap != null) {
+                group.bootstrap_generation = true;
+            }
         }
         for (split_transitions) |transition| {
             if (self.groups.getPtr(transition.destination_group_id)) |group| {
@@ -14925,7 +14970,7 @@ const PlacementTopologyIndex = struct {
 
     fn initialVoters(self: *const @This(), group_id: u64) ?[]const u64 {
         const group = self.groups.get(group_id) orelse return null;
-        if (group.pristine or group.bootstrap_generation) return group.peers.items;
+        if (group.pristine or group.bootstrap_generation or completeDarkGeneration(group)) return group.peers.items;
         // Transition peer lists intentionally include non-voting targets. A
         // partially projected transition cannot prove the complete incumbent
         // voter set, so an empty replica must wait for every member row rather
@@ -14936,9 +14981,16 @@ const PlacementTopologyIndex = struct {
 
     fn learners(self: *const @This(), group_id: u64) ?[]const u64 {
         const group = self.groups.get(group_id) orelse return null;
-        if (group.pristine or group.bootstrap_generation) return &.{};
+        if (group.pristine or group.bootstrap_generation or completeDarkGeneration(group)) return &.{};
         if (group.member_rows.items.len != group.peers.items.len) return null;
         return group.transition_learners.items;
+    }
+
+    fn completeDarkGeneration(group: Group) bool {
+        return group.peers.items.len > 0 and
+            group.member_rows.items.len == group.peers.items.len and
+            group.transition_voters.items.len == 0 and
+            group.transition_learners.items.len == group.member_rows.items.len;
     }
 };
 
@@ -14958,6 +15010,49 @@ test "placement topology bootstraps active split destination as a new voter gene
     defer topology.deinit();
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(706).?);
     try std.testing.expectEqual(@as(usize, 0), topology.learners(706).?.len);
+}
+
+test "placement topology bootstraps dark restore placements as a new voter generation" {
+    const restore = @import("../raft/catalog.zig").BackupRestoreBootstrapRecord{
+        .backup_id = "backup-706",
+        .artifact_backup_id = "artifact-706",
+        .location = "s3://backups/prod",
+        .snapshot_path = "backup-706/groups/705.afb",
+        .connection = "prod-backups",
+        .artifact_size_bytes = 1,
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    };
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 706, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .fetch_snapshot, .backup_restore_bootstrap = restore }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping },
+        .{ .record = .{ .group_id = 706, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .fetch_snapshot, .backup_restore_bootstrap = restore }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping },
+        .{ .record = .{ .group_id = 706, .replica_id = 3, .local_node_id = 3, .bootstrap_mode = .fetch_snapshot, .backup_restore_bootstrap = restore }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping },
+    };
+    var topology = try PlacementTopologyIndex.initForSnapshot(std.testing.allocator, &intents, &.{});
+    defer topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(706).?);
+    try std.testing.expectEqual(@as(usize, 0), topology.learners(706).?.len);
+}
+
+test "placement topology retains voter authority after restore descriptors clear" {
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 707, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .fetch_snapshot }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping, .relocation_generation = 2 },
+        .{ .record = .{ .group_id = 707, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .fetch_snapshot }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping, .relocation_generation = 2 },
+        .{ .record = .{ .group_id = 707, .replica_id = 3, .local_node_id = 3, .bootstrap_mode = .fetch_snapshot }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping, .relocation_generation = 2 },
+    };
+    var topology = try PlacementTopologyIndex.init(std.testing.allocator, &intents);
+    defer topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(707).?);
+    try std.testing.expectEqual(@as(usize, 0), topology.learners(707).?.len);
+
+    const mixed_relocation = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 708, .replica_id = 1, .local_node_id = 1 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 708, .replica_id = 2, .local_node_id = 2 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .draining, .relocation_generation = 2 },
+        .{ .record = .{ .group_id = 708, .replica_id = 3, .local_node_id = 3, .bootstrap_mode = .fetch_snapshot }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping, .relocation_generation = 2 },
+    };
+    var mixed_topology = try PlacementTopologyIndex.init(std.testing.allocator, &mixed_relocation);
+    defer mixed_topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, mixed_topology.initialVoters(708).?);
+    try std.testing.expectEqualSlices(u64, &.{3}, mixed_topology.learners(708).?);
 }
 
 test "placement topology uses authoritative split peer set during partial projection" {
@@ -15005,6 +15100,16 @@ test "placement topology refuses partial transition bootstrap voters" {
     var topology = try PlacementTopologyIndex.init(std.testing.allocator, &partial);
     defer topology.deinit();
     try std.testing.expect(topology.initialVoters(704) == null);
+
+    const one_dark_row = [_]antfly.raft.PlacementIntent{.{
+        .record = .{ .group_id = 709, .replica_id = 4, .local_node_id = 4, .bootstrap_mode = .fetch_snapshot },
+        .peer_node_ids = &.{ 1, 2, 3, 4 },
+        .serving_state = .bootstrapping,
+        .relocation_generation = 9,
+    }};
+    var dark_topology = try PlacementTopologyIndex.init(std.testing.allocator, &one_dark_row);
+    defer dark_topology.deinit();
+    try std.testing.expect(dark_topology.initialVoters(709) == null);
 }
 
 fn appendOwnedPeerRouteUpsert(
@@ -15867,6 +15972,7 @@ const RemoteMetadataSource = struct {
         location_uri: []const u8,
         connection: []const u8,
         artifact_backup_id: []const u8,
+        restore_job_id: u64,
         manifest: *const antfly.public_api.backups.TableBackupManifest,
     ) !void {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
@@ -15875,6 +15981,7 @@ const RemoteMetadataSource = struct {
             .artifact_backup_id = artifact_backup_id,
             .location = location_uri,
             .connection = connection,
+            .restore_job_id = restore_job_id,
             .manifest = manifest.*,
         }, .{});
         defer alloc.free(body);
@@ -27277,7 +27384,7 @@ test "data server wires configured HA executors into API server" {
     {
         var replica_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, replica_catalog_path);
         defer replica_catalog.deinit();
-        try replica_catalog.catalog().upsertReplica(.{
+        _ = try replica_catalog.catalog().upsertReplica(.{
             .group_id = 1,
             .replica_id = 101,
             .local_node_id = 11,
@@ -27798,6 +27905,18 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_received_lsn{slot=\"standby-a\"} 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_status_code{slot=\"standby-a\"} 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_mirror_failures_total 0\n") != null);
+}
+
+test "data raft preproposal admission errors are never reported as committed" {
+    for ([_]anyerror{
+        error.Cancelled,
+        error.EnrichmentWaitCanceled,
+        error.EnrichmentWaitTimeout,
+        error.AsyncWorkerFailed,
+    }) |err| {
+        try std.testing.expect(DataServer.dataRaftPreproposalAdmissionError(err) == error.LeaderUnavailable);
+    }
+    try std.testing.expect(DataServer.dataRaftPreproposalAdmissionError(error.OutOfMemory) == error.OutOfMemory);
 }
 
 test "raft proposal materializes a default batch timestamp exactly once" {

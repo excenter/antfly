@@ -5547,6 +5547,8 @@ pub const ProvisionedTableWriteSource = struct {
     dropped_table_delete_owner_id: u64 = 0,
     restore_repair_work_group: Io.Group = .init,
     restore_repair_shutdown: std.atomic.Value(bool) = .init(false),
+    restore_repair_active_mutex: std.atomic.Mutex = .unlocked,
+    restore_repair_active_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     restore_repair_completion_mutex: Io.Mutex = .init,
     restore_repair_completion_group: Io.Group = .init,
     restore_repair_completion_scheduled: std.atomic.Value(bool) = .init(false),
@@ -6258,6 +6260,11 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.table_activity_threaded.io();
         self.restore_repair_shutdown.store(true, .release);
         self.restore_repair_work_group.cancel(io);
+        lockAtomic(&self.restore_repair_active_mutex);
+        std.debug.assert(self.restore_repair_active_groups.count() == 0);
+        self.restore_repair_active_groups.deinit(std.heap.page_allocator);
+        self.restore_repair_active_groups = .empty;
+        self.restore_repair_active_mutex.unlock();
         self.restore_repair_completion_group.await(io) catch {};
         self.freeRestoreRepairCompletions();
         self.freeStructuralReconcileTables();
@@ -6389,6 +6396,50 @@ pub const ProvisionedTableWriteSource = struct {
                 return error.DenseRepairBackpressure;
             }
         }
+    }
+
+    pub fn preflightReplicatedWriteAdmission(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        cancellation: db_mod.types.CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
+        if (self.local_write_owner) |owner| {
+            return owner.preflightReplicatedWriteAdmission(
+                group_id,
+                table_name,
+                req,
+                cancellation,
+                deadline_ns,
+            );
+        }
+        if (!replicatedBatchRequiresDerivedAdmission(req)) return;
+
+        lockAtomic(&self.local_db_mutex);
+        var resident: ?ProvisionedTableWriteCache.CachedDb = null;
+        var foreground_blocked = false;
+        if (self.write_cache) |cache| {
+            resident = cache.leaseLiveEntryForLocalMutationLocked(group_id, table_name, true);
+            foreground_blocked = resident == null and cache.hasForegroundStateForGroupTableLocked(group_id, table_name);
+        }
+        if (resident == null and !foreground_blocked) {
+            if (self.startup_write_cache) |cache| {
+                if (self.write_cache == null or self.write_cache.? != cache) {
+                    resident = cache.leaseLiveEntryForLocalMutationLocked(group_id, table_name, true);
+                    foreground_blocked = resident == null and cache.hasForegroundStateForGroupTableLocked(group_id, table_name);
+                }
+            }
+        }
+        self.local_db_mutex.unlock();
+
+        if (resident) |*cached| {
+            defer cached.deinit(std.heap.page_allocator);
+            try cached.db.preflightReplicatedWriteAdmission(req.sync_level, cancellation, deadline_ns);
+            return;
+        }
+        if (foreground_blocked) return error.LsmRootWriterAlreadyOpen;
     }
 
     fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) !u64 {
@@ -12335,6 +12386,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn runAndDeinit(work: *@This()) Io.Cancelable!void {
             defer RestoreRepairCatchUpWork.deinit(work);
+            defer work.source.finishRestoreRepairCatchUp(work.group_id);
             work.run() catch |err| {
                 std.log.warn("restore background catch-up failed group_id={d} class={s}", .{
                     work.group_id,
@@ -12431,17 +12483,17 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
-    fn requestRestoreRepairCatchUp(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        if (self.restore_repair_shutdown.load(.acquire)) return;
+    pub fn requestRestoreRepairCatchUp(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        if (self.restore_repair_shutdown.load(.acquire)) return false;
         const alloc = std.heap.page_allocator;
         const work = alloc.create(RestoreRepairCatchUpWork) catch |err| {
             std.log.warn("restore background catch-up failed phase=allocation group_id={d} class={s}", .{ group_id, @errorName(err) });
-            return;
+            return false;
         };
         const owned_table_name = alloc.dupe(u8, table_name) catch |err| {
             alloc.destroy(work);
             std.log.warn("restore background catch-up failed phase=identity_allocation group_id={d} class={s}", .{ group_id, @errorName(err) });
-            return;
+            return false;
         };
         work.* = .{
             .alloc = alloc,
@@ -12449,11 +12501,34 @@ pub const ProvisionedTableWriteSource = struct {
             .group_id = group_id,
             .table_name = owned_table_name,
         };
+
+        lockAtomic(&self.restore_repair_active_mutex);
+        if (self.restore_repair_shutdown.load(.acquire) or self.restore_repair_active_groups.contains(group_id)) {
+            self.restore_repair_active_mutex.unlock();
+            RestoreRepairCatchUpWork.deinit(work);
+            return false;
+        }
+        self.restore_repair_active_groups.put(alloc, group_id, {}) catch |err| {
+            self.restore_repair_active_mutex.unlock();
+            RestoreRepairCatchUpWork.deinit(work);
+            std.log.warn("restore background catch-up failed phase=dedupe_allocation group_id={d} class={s}", .{ group_id, @errorName(err) });
+            return false;
+        };
+        self.restore_repair_active_mutex.unlock();
+
         self.restore_repair_work_group.concurrent(self.table_activity_threaded.io(), RestoreRepairCatchUpWork.runAndDeinit, .{work}) catch |err| {
+            self.finishRestoreRepairCatchUp(group_id);
             RestoreRepairCatchUpWork.deinit(work);
             std.log.warn("restore background catch-up failed phase=submit group_id={d} class={s}", .{ group_id, @errorName(err) });
-            return;
+            return false;
         };
+        return true;
+    }
+
+    fn finishRestoreRepairCatchUp(self: *ProvisionedTableWriteSource, group_id: u64) void {
+        lockAtomic(&self.restore_repair_active_mutex);
+        std.debug.assert(self.restore_repair_active_groups.remove(group_id));
+        self.restore_repair_active_mutex.unlock();
     }
 
     fn freeStructuralReconcileTables(self: *ProvisionedTableWriteSource) void {
@@ -15444,7 +15519,7 @@ pub const ProvisionedTableWriteSource = struct {
             try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
             if (apply_req.transaction != null) {
                 try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-                try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
+                try applyRaftTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
             } else try cached.db.batchReplicatedApply(apply_req);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
@@ -15476,7 +15551,7 @@ pub const ProvisionedTableWriteSource = struct {
             try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
             if (apply_req.transaction != null) {
                 try db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-                try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
+                try applyRaftTransactionMutation(alloc, &db, table_name, group_id, apply_req);
             } else try db.batchReplicatedApply(apply_req);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);
@@ -18755,7 +18830,81 @@ fn applyReplicatedTransactionMutation(
     group_id: u64,
     req: db_mod.types.BatchRequest,
 ) !void {
-    try applyReplicatedTransactionMutationWithCancellation(alloc, db, table_name, group_id, req, .none);
+    try applyTransactionMutationWithOptions(alloc, db, table_name, group_id, req, .{});
+}
+
+fn applyRaftTransactionMutation(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+) !void {
+    try applyTransactionMutationWithOptions(alloc, db, table_name, group_id, req, .{
+        .raft_apply = true,
+    });
+}
+
+fn replicatedBatchRequiresDerivedAdmission(req: db_mod.types.BatchRequest) bool {
+    const mutation = req.transaction orelse return req.writes.len != 0 or
+        req.deletes.len != 0 or
+        req.transforms.len != 0 or
+        req.graph_writes.len != 0 or
+        req.graph_deletes.len != 0;
+    return switch (mutation) {
+        .resolve => |resolve| resolve.status == .committed,
+        .begin, .prepare, .acknowledge, .cleanup => false,
+    };
+}
+
+test "replicated write admission classifies every mutation family" {
+    const txn_id: db_mod.types.TxnId = .{0x11} ** 16;
+    const participant = [_][]const u8{"docs:7001"};
+    const cases = [_]struct {
+        req: db_mod.types.BatchRequest,
+        expected: bool,
+    }{
+        .{ .req = .{}, .expected = false },
+        .{ .req = .{ .writes = &.{.{ .key = "doc:a", .value = "{}" }} }, .expected = true },
+        .{ .req = .{ .deletes = &.{"doc:a"} }, .expected = true },
+        .{ .req = .{ .transforms = &.{.{ .key = "doc:a", .operations = &.{} }} }, .expected = true },
+        .{ .req = .{ .graph_writes = &.{.{ .index_name = "graph", .source = "a", .target = "b", .edge_type = "related" }} }, .expected = true },
+        .{ .req = .{ .graph_deletes = &.{.{ .index_name = "graph", .source = "a", .target = "b", .edge_type = "related" }} }, .expected = true },
+        .{ .req = .{ .transaction = .{ .begin = .{
+            .txn_id = txn_id,
+            .begin_timestamp = 1,
+            .created_at_ns = 1,
+            .topology_epoch = 1,
+            .participants = &participant,
+        } } }, .expected = false },
+        .{ .req = .{
+            .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 1 } },
+        }, .expected = false },
+        .{ .req = .{ .transaction = .{ .resolve = .{
+            .txn_id = txn_id,
+            .status = .committed,
+            .commit_version = 2,
+        } } }, .expected = true },
+        .{ .req = .{ .transaction = .{ .resolve = .{
+            .txn_id = txn_id,
+            .status = .aborted,
+            .commit_version = 2,
+        } } }, .expected = false },
+        .{ .req = .{ .transaction = .{ .acknowledge = .{
+            .txn_id = txn_id,
+            .participant = "docs:7001",
+        } } }, .expected = false },
+        .{ .req = .{ .transaction = .{ .cleanup = .{
+            .txn_id = txn_id,
+            .cutoff_timestamp = 3,
+            .retained_cutoff_timestamp = 2,
+        } } }, .expected = false },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, replicatedBatchRequiresDerivedAdmission(case.req));
+    }
 }
 
 fn applyReplicatedTransactionMutationWithCancellation(
@@ -18765,6 +18914,24 @@ fn applyReplicatedTransactionMutationWithCancellation(
     group_id: u64,
     req: db_mod.types.BatchRequest,
     visibility_cancellation: db_mod.types.CancellationToken,
+) !void {
+    try applyTransactionMutationWithOptions(alloc, db, table_name, group_id, req, .{
+        .visibility_cancellation = visibility_cancellation,
+    });
+}
+
+const TransactionMutationApplyOptions = struct {
+    visibility_cancellation: db_mod.types.CancellationToken = .none,
+    raft_apply: bool = false,
+};
+
+fn applyTransactionMutationWithOptions(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+    opts: TransactionMutationApplyOptions,
 ) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
     switch (mutation) {
@@ -18788,14 +18955,25 @@ fn applyReplicatedTransactionMutationWithCancellation(
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
-            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
-                begin.txn_id,
-                begin.begin_timestamp,
-                begin.created_at_ns,
-                durable_participants,
-                coordinator,
-                begin.retain_terminal,
-            );
+            if (opts.raft_apply) {
+                _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetentionReplicatedApply(
+                    begin.txn_id,
+                    begin.begin_timestamp,
+                    begin.created_at_ns,
+                    durable_participants,
+                    coordinator,
+                    begin.retain_terminal,
+                );
+            } else {
+                _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+                    begin.txn_id,
+                    begin.begin_timestamp,
+                    begin.created_at_ns,
+                    durable_participants,
+                    coordinator,
+                    begin.retain_terminal,
+                );
+            }
         },
         .prepare => |prepare| try db.writeTransaction(prepare.txn_id, .{
             .writes = batchWritesAsTransactionWrites(req.writes),
@@ -18804,13 +18982,21 @@ fn applyReplicatedTransactionMutationWithCancellation(
             .predicates = req.predicates,
         }),
         .resolve => |resolve| {
-            try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
-                resolve.txn_id,
-                resolve.status,
-                resolve.commit_version,
-                req.sync_level,
-                visibility_cancellation,
-            );
+            if (opts.raft_apply) {
+                try db.resolveTransactionIntentsReplicatedApply(
+                    resolve.txn_id,
+                    resolve.status,
+                    resolve.commit_version,
+                );
+            } else {
+                try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
+                    resolve.txn_id,
+                    resolve.status,
+                    resolve.commit_version,
+                    req.sync_level,
+                    opts.visibility_cancellation,
+                );
+            }
             const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
             defer alloc.free(local_participant);
             // Retained coordinators keep their own acknowledgement pending
@@ -18821,18 +19007,28 @@ fn applyReplicatedTransactionMutationWithCancellation(
                 else => return err,
             };
             if (!defer_coordinator_ack) {
-                db.markTransactionParticipantResolved(resolve.txn_id, local_participant) catch |err| switch (err) {
+                const mark_result = if (opts.raft_apply)
+                    db.markTransactionParticipantResolvedReplicatedApply(resolve.txn_id, local_participant)
+                else
+                    db.markTransactionParticipantResolved(resolve.txn_id, local_participant);
+                mark_result catch |err| switch (err) {
                     transactions_mod.TxnError.TxnNotFound => if (resolve.status != .aborted) return err,
                     else => return err,
                 };
             }
         },
-        .acknowledge => |ack| db.markTransactionParticipantResolved(ack.txn_id, ack.participant) catch |err| switch (err) {
-            // Cleanup and acknowledgements are independently retryable Raft
-            // commands. Once cleanup wins, a late acknowledgement is a safe
-            // no-op and must not recreate coordinator sidecar metadata.
-            transactions_mod.TxnError.TxnNotFound => {},
-            else => return err,
+        .acknowledge => |ack| {
+            const mark_result = if (opts.raft_apply)
+                db.markTransactionParticipantResolvedReplicatedApply(ack.txn_id, ack.participant)
+            else
+                db.markTransactionParticipantResolved(ack.txn_id, ack.participant);
+            mark_result catch |err| switch (err) {
+                // Cleanup and acknowledgements are independently retryable Raft
+                // commands. Once cleanup wins, a late acknowledgement is a safe
+                // no-op and must not recreate coordinator sidecar metadata.
+                transactions_mod.TxnError.TxnNotFound => {},
+                else => return err,
+            };
         },
         .cleanup => |cleanup| _ = try db.cleanupTransactionMetadataIfEligible(
             cleanup.txn_id,
@@ -26104,7 +26300,8 @@ test "provisioned restore repair source deinit cancels sleeping retry worker" {
     test_before_restore_repair_retry_sleep_hook = .{ .ptr = &hook_ctx, .run = HookCtx.run };
     defer test_before_restore_repair_retry_sleep_hook = null;
 
-    source.requestRestoreRepairCatchUp("docs", 7001);
+    try std.testing.expect(source.requestRestoreRepairCatchUp("docs", 7001));
+    try std.testing.expect(!source.requestRestoreRepairCatchUp("docs", 7001));
     const wait_start_ns = platform_time.monotonicNs();
     while (!hook_ctx.seen.load(.acquire)) {
         if (platform_time.monotonicNs() -| wait_start_ns > std.time.ns_per_s) return error.TestUnexpectedResult;
@@ -26210,7 +26407,7 @@ test "provisioned restore repair worker retries transient step failures to compl
     test_before_restore_repair_step_hook = .{ .ptr = &hook_ctx, .run = HookCtx.run };
     defer test_before_restore_repair_step_hook = null;
 
-    source.requestRestoreRepairCatchUp("docs", 7001);
+    try std.testing.expect(source.requestRestoreRepairCatchUp("docs", 7001));
     source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
     source.restore_repair_completion_group.await(source.table_activity_threaded.io()) catch {};
 
@@ -45508,6 +45705,83 @@ test "provisioned leader admission rejects uncommitted writes under dense repair
     try source.preflightDenseRepairWriteAdmission(7002, "docs");
     entry.db.async_context.index_repair_replay_pinned.store(false, .release);
     try source.preflightDenseRepairWriteAdmission(7001, "docs");
+}
+
+test "provisioned leader admission drains replicated derived backlog before proposal" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-backlog-leader-admission", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var resources = resource_manager_mod.ResourceManager.init(.{
+        .derived_backlog_high_sequences = 1,
+        .derived_backlog_resume_sequences = 0,
+        .derived_backlog_throttle_window_sequences = 1,
+    });
+    defer resources.deinit(alloc);
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    write_cache.resource_manager = &resources;
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    var cached = try write_cache.getOrOpenLockedMode(path, Catalog.iface(), 7001, 1, "docs", .startup_catch_up);
+    defer cached.deinit(alloc);
+    try cached.db.batchReplicatedApply(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+    });
+    try cached.db.batchReplicatedApply(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+    });
+    try std.testing.expectEqual(@as(u64, 0), try cached.db.core.loadAppliedSequence(alloc, "search_idx"));
+
+    try source.preflightReplicatedWriteAdmission(7001, "docs", .{
+        .writes = &.{.{ .key = "doc:c", .value = "{\"title\":\"gamma\"}" }},
+        .sync_level = .write,
+    }, .none, null);
+    try std.testing.expectEqual(@as(u64, 2), try cached.db.core.loadAppliedSequence(alloc, "search_idx"));
 }
 
 test "median key lookup reuses startup writer instead of reopening its root" {

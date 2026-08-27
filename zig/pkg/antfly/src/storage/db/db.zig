@@ -360,6 +360,8 @@ pub const OpenOptions = struct {
     hbc_cache: ?*hbc_mod.Cache = null,
     lsm_root_generation: u64 = 0,
     staged_generation: ?*const generation_lifecycle.StagedGeneration = null,
+    borrowed_generation_read: ?*const generation_lifecycle.ReadLease = null,
+    borrowed_exclusive_generation_transition: ?*const generation_lifecycle.ExclusiveTransition = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     /// Optional storage-backend capacity probe. BackendRuntime configurators
     /// may install this while composing a DB open; it is resource policy input,
@@ -1572,6 +1574,8 @@ const BatchExecutionOptions = struct {
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     bypass_ha_write_gate: bool = false,
+    bypass_derived_health_gate: bool = false,
+    bypass_derived_backlog_pressure: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
@@ -1579,6 +1583,14 @@ const BatchExecutionOptions = struct {
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,
+};
+
+const TransactionResolveExecutionOptions = struct {
+    visibility_cancellation: types.CancellationToken = .none,
+    wait_for_sync_level: bool = true,
+    bypass_ha_write_gate: bool = false,
+    bypass_derived_health_gate: bool = false,
+    bypass_derived_backlog_pressure: bool = false,
 };
 
 const TransactionResolution = struct {
@@ -3316,9 +3328,19 @@ pub const DB = struct {
                     try configurator.configure(path, &opts);
                 }
             }
+            const borrowed_generation_guards = @intFromBool(opts.staged_generation != null) +
+                @intFromBool(opts.borrowed_generation_read != null) +
+                @intFromBool(opts.borrowed_exclusive_generation_transition != null);
+            if (borrowed_generation_guards > 1) return error.InvalidGenerationTransition;
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
                 break :staged_blk null;
+            } else if (opts.borrowed_generation_read) |generation_read| read_blk: {
+                try generation_read.validate(path);
+                break :read_blk null;
+            } else if (opts.borrowed_exclusive_generation_transition) |exclusive_transition| exclusive_blk: {
+                try exclusive_transition.validate(path);
+                break :exclusive_blk null;
             } else if (opts.physical_root_mode == .external_backend)
                 null
             else
@@ -5388,6 +5410,29 @@ pub const DB = struct {
         try self.batchInternal(req, null, .{ .validate_range_ownership = false });
     }
 
+    pub fn preflightReplicatedWriteAdmission(
+        self: *DB,
+        sync_level: types.SyncLevel,
+        cancellation: types.CancellationToken,
+        deadline_ns: ?u64,
+    ) anyerror!void {
+        try self.executor.failIfUnhealthy();
+        if (!syncLevelParticipatesInDerivedBacklogPressure(sync_level)) return;
+        var ctx = self.batchContext();
+        if (shouldDeferBacklogPressureForExternalDenseBulk(&ctx, sync_level)) return;
+        const throttle_target = self.executor.backlogThrottleTargetSequence() orelse return;
+        self.runDerivedUntilWithVisibilityWait(throttle_target, .{
+            .cancellation = cancellation,
+            .deadline_ns = deadline_ns,
+        }) catch |err| switch (err) {
+            error.WriterLocked, error.ReplayDocumentNotVisible, error.ArtifactRepairRequired => {
+                self.executor.notifySequence(throttle_target);
+                return;
+            },
+            else => return err,
+        };
+    }
+
     pub fn batchReplicatedApply(self: *DB, req: types.BatchRequest) anyerror!void {
         try self.batchReplicatedApplyWithMarker(req, null);
     }
@@ -5399,6 +5444,8 @@ pub const DB = struct {
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_ha_write_gate = true,
+            .bypass_derived_health_gate = true,
+            .bypass_derived_backlog_pressure = true,
             .ha_applied_lsn_marker = applied_lsn_marker,
         });
     }
@@ -5719,7 +5766,7 @@ pub const DB = struct {
             }
         }
 
-        try self.executor.failIfUnhealthy();
+        if (!opts.bypass_derived_health_gate) try self.executor.failIfUnhealthy();
 
         // Global LSM throttling must happen before the DB apply lock. Derived
         // and maintenance workers may need that lock to publish or flush the
@@ -5754,7 +5801,13 @@ pub const DB = struct {
                 self.core.unlockApply();
                 apply_mutex_held = false;
                 if (!opts.bypass_ha_write_gate) try self.flushTransactionHAOutbox(resolution.txn_id);
-                try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
+                if (opts.wait_for_sync_level) {
+                    try self.waitForResolvedTransactionSyncWithCancellation(
+                        req.sync_level,
+                        outcome.replay_sequence,
+                        opts.visibility_cancellation,
+                    );
+                }
                 return;
             }
         }
@@ -6509,7 +6562,13 @@ pub const DB = struct {
         if (!transaction_applied.applied) {
             self.core.unlockApply();
             apply_mutex_held = false;
-            try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
+            if (opts.wait_for_sync_level) {
+                try self.waitForResolvedTransactionSyncWithCancellation(
+                    effective_req.sync_level,
+                    transaction_applied.replay_sequence,
+                    opts.visibility_cancellation,
+                );
+            }
             return;
         }
         if (persisted_range != null) {
@@ -6561,7 +6620,9 @@ pub const DB = struct {
             var pressure_ctx = self.batchContext();
             const backlog_pressure_start_ns = monotonicTimeNs();
             try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
-            try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
+            if (!opts.bypass_derived_backlog_pressure) {
+                try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
+            }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
         }
         const wait_sync_start_ns = monotonicTimeNs();
@@ -15775,6 +15836,27 @@ pub const DB = struct {
         );
     }
 
+    pub fn beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetentionReplicatedApply(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+    ) !transactions_mod.TxnId {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            retain_terminal,
+        );
+    }
+
     pub fn writeIntents(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -15879,9 +15961,46 @@ pub const DB = struct {
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
     ) !void {
-        var ha_mutation = self.acquireHAMutationShared();
+        try self.resolveTransactionIntentsWithOptions(
+            txn_id,
+            status,
+            commit_version,
+            sync_level,
+            .{ .visibility_cancellation = visibility_cancellation },
+        );
+    }
+
+    pub fn resolveTransactionIntentsReplicatedApply(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+    ) !void {
+        try self.resolveTransactionIntentsWithOptions(
+            txn_id,
+            status,
+            commit_version,
+            .write,
+            .{
+                .wait_for_sync_level = false,
+                .bypass_ha_write_gate = true,
+                .bypass_derived_health_gate = true,
+                .bypass_derived_backlog_pressure = true,
+            },
+        );
+    }
+
+    fn resolveTransactionIntentsWithOptions(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        sync_level: types.SyncLevel,
+        opts: TransactionResolveExecutionOptions,
+    ) !void {
+        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        if (!opts.bypass_ha_write_gate) try self.enforceHAWriteGate();
         if (status != .committed) {
             lockApply(self);
             defer self.core.unlockApply();
@@ -15919,8 +16038,14 @@ pub const DB = struct {
                     return err;
                 };
                 self.core.unlockApply();
-                try self.flushTransactionHAOutbox(txn_id);
-                try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
+                if (!opts.bypass_ha_write_gate) try self.flushTransactionHAOutbox(txn_id);
+                if (opts.wait_for_sync_level) {
+                    try self.waitForResolvedTransactionSyncWithCancellation(
+                        sync_level,
+                        outcome.replay_sequence,
+                        opts.visibility_cancellation,
+                    );
+                }
                 return;
             }
 
@@ -15933,7 +16058,11 @@ pub const DB = struct {
                 .timestamp_ns = commit_version,
                 .sync_level = sync_level,
             }, null, .{
-                .visibility_cancellation = visibility_cancellation,
+                .visibility_cancellation = opts.visibility_cancellation,
+                .wait_for_sync_level = opts.wait_for_sync_level,
+                .bypass_ha_write_gate = opts.bypass_ha_write_gate,
+                .bypass_derived_health_gate = opts.bypass_derived_health_gate,
+                .bypass_derived_backlog_pressure = opts.bypass_derived_backlog_pressure,
                 .transaction_resolution = .{
                     .txn_id = txn_id,
                     .status = status,
@@ -15976,6 +16105,12 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.core.markTransactionParticipantResolved(txn_id, participant);
+    }
+
+    pub fn markTransactionParticipantResolvedReplicatedApply(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantResolved(txn_id, participant);
@@ -53895,6 +54030,121 @@ test "db replicated apply decouples client enrichment sync from raft apply execu
     try std.testing.expectEqual(@as(usize, 0), journal_record.record.changed_artifact_keys.len);
 }
 
+test "db replicated apply does not synchronously drain derived backlog" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .derived_backlog_high_sequences = 1,
+        .derived_backlog_resume_sequences = 0,
+        .derived_backlog_throttle_window_sequences = 1,
+    });
+    defer resource_manager.deinit(alloc);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .resource_manager = &resource_manager,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+
+    try db.batchReplicatedApply(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+        },
+    });
+    try std.testing.expectEqual(@as(u64, 0), try db.core.loadAppliedSequence(alloc, "ft_v1"));
+
+    try db.batchReplicatedApply(.{
+        .writes = &.{
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+    });
+    try std.testing.expectEqual(@as(u64, 0), try db.core.loadAppliedSequence(alloc, "ft_v1"));
+
+    const cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.EnrichmentWaitCanceled,
+        db.preflightReplicatedWriteAdmission(.write, types.CancellationToken.fromAtomic(&cancelled), null),
+    );
+    try std.testing.expectError(
+        error.EnrichmentWaitTimeout,
+        db.preflightReplicatedWriteAdmission(.write, .none, 0),
+    );
+    try std.testing.expectEqual(@as(u64, 0), try db.core.loadAppliedSequence(alloc, "ft_v1"));
+
+    try db.preflightReplicatedWriteAdmission(.write, .none, null);
+    try std.testing.expectEqual(@as(u64, 2), try db.core.loadAppliedSequence(alloc, "ft_v1"));
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\"}" },
+        },
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(@as(u64, 2), try db.core.loadAppliedSequence(alloc, "ft_v1"));
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(@as(u64, 4), try db.core.loadAppliedSequence(alloc, "ft_v1"));
+}
+
+test "db replicated transaction commit does not synchronously drain derived backlog" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .derived_backlog_high_sequences = 1,
+        .derived_backlog_resume_sequences = 0,
+        .derived_backlog_throttle_window_sequences = 1,
+    });
+    defer resource_manager.deinit(alloc);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .resource_manager = &resource_manager,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+
+    for (0..2) |i| {
+        const txn_id = try db.beginTransaction(10_000 + i);
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        try db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = key, .value = "{\"title\":\"transaction\"}" }},
+        });
+        try db.resolveTransactionIntentsReplicatedApply(
+            txn_id,
+            .committed,
+            20_000 + i,
+        );
+    }
+
+    try std.testing.expectEqual(@as(u64, 0), try db.core.loadAppliedSequence(alloc, "ft_v1"));
+    try db.preflightReplicatedWriteAdmission(.write, .none, null);
+    try std.testing.expectEqual(@as(u64, 2), try db.core.loadAppliedSequence(alloc, "ft_v1"));
+}
+
 test "db enrichments precomputed watermark advances across replay entries without enrichment debt" {
     const alloc = std.testing.allocator;
 
@@ -68217,6 +68467,34 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     var found = (try db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", found.json);
+
+    const txn_id: transactions_mod.TxnId = .{0x33} ** 16;
+    const participant = "docs:300";
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            10,
+            10,
+            &.{participant},
+            true,
+            false,
+        ),
+    );
+    _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetentionReplicatedApply(
+        txn_id,
+        10,
+        10,
+        &.{participant},
+        true,
+        false,
+    );
+    try db.resolveTransactionIntentsReplicatedApply(txn_id, .committed, 11);
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.markTransactionParticipantResolved(txn_id, participant),
+    );
+    try db.markTransactionParticipantResolvedReplicatedApply(txn_id, participant);
 }
 
 test "storage.ha db write gate rejects fenced former primary writes" {
