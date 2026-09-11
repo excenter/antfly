@@ -128,8 +128,16 @@ const Factory = struct {
             .vtable = &.{
                 .build_descriptor = buildDescriptor,
                 .free_descriptor = freeDescriptor,
+                .accepts_record = acceptsRecord,
             },
         };
+    }
+
+    fn acceptsRecord(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        // Data processes may reuse our numeric node ID. This dedicated host
+        // owns only metadata, including when recovering an older catalog.
+        return record.group_id == self.metadata_group_id;
     }
 
     fn buildDescriptor(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
@@ -2527,6 +2535,130 @@ test "metadata runtime preserves projected tables across restart" {
         try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
         try std.testing.expectEqualStrings("docs", snapshot.tables[0].name);
     }
+}
+
+test "metadata runtime excludes colliding data placements before and after restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-role/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-role/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-role/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    const metadata_group_id = group_ids.main_metadata_group_id;
+    const data_group_id = 1951;
+    const local_node_id = 3;
+    for (0..2) |boot| {
+        var server = try Server.init(std.testing.allocator, .{
+            .local_node_id = local_node_id,
+            .metadata_group_id = metadata_group_id,
+            .replica_root_dir = replica_root,
+            .replica_catalog_path = catalog_path,
+            .snapshot_root_dir = snapshot_root,
+        });
+        defer server.deinit();
+        try server.start();
+        try server.bootstrapLocal(metadata_group_id, local_node_id);
+        const svc = server.metadataHttpService();
+        if (boot == 0) {
+            // Register a real placement target: an unknown node makes the
+            // placement CAS a no-op and would give a vacuous passing test.
+            try svc.upsertNode(.{ .node_id = local_node_id });
+            try server.runRound();
+            try svc.upsertStore(.{ .store_id = local_node_id, .node_id = local_node_id, .role = "data", .live = true });
+            try server.runRound();
+            // Keep the placement live in the topology reconciler too; an
+            // orphan placement is legitimately removed by the server loop.
+            try svc.upsertTable(.{ .table_id = 77, .name = "docs", .desired_replica_count = 1 });
+            try svc.upsertRange(.{ .group_id = data_group_id, .table_id = 77, .start_key = "" });
+            try svc.upsertReplicaIntent(.{
+                .record = .{
+                    .group_id = data_group_id,
+                    .replica_id = 1,
+                    .local_node_id = local_node_id,
+                    .bootstrap_mode = .empty,
+                },
+                .store_id = local_node_id,
+                .peer_node_ids = &.{},
+            }, null, 0, false);
+        }
+        // Exercise the actual leased control loop, including re-election and
+        // WAL recovery on the second boot, rather than just the filter itself.
+        for (0..16) |_| try server.runRound();
+        const intents = try svc.listProjectedPlacementIntents(std.testing.allocator);
+        defer svc.freeProjectedPlacementIntents(std.testing.allocator, intents);
+        try std.testing.expectEqual(@as(usize, 1), intents.len);
+        try std.testing.expectEqual(@as(u64, data_group_id), intents[0].record.group_id);
+        try std.testing.expectEqual(@as(u64, local_node_id), intents[0].store_id);
+        try std.testing.expect(svc.reconcileLeaseStats().held_by_local);
+        try std.testing.expectEqual(svc.placement_epoch.load(.monotonic), svc.local_placement_epoch.?);
+        try std.testing.expectEqual(.active, svc.raft.host.status(metadata_group_id));
+        try std.testing.expectEqual(.absent, svc.raft.host.status(data_group_id));
+        try std.testing.expectEqual(@as(usize, 1), svc.raft.host.http_host.transport_stack.transport_host.served_groups.count());
+
+        // Metadata mutations must still make progress with the colliding
+        // placement present; role isolation must not disable reconciliation.
+        const table_name = if (boot == 0) "docs-first-boot" else "docs-restarted";
+        try svc.upsertTable(.{ .table_id = 77, .name = table_name, .desired_replica_count = 1 });
+        for (0..4) |_| try server.runRound();
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
+        try std.testing.expectEqualStrings(table_name, snapshot.tables[0].name);
+    }
+}
+
+test "metadata runtime skips foreign catalog replicas before serving after restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-role-catalog/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-role-catalog/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-role-catalog/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+    const cfg: ServerConfig = .{
+        .local_node_id = 3,
+        .metadata_group_id = 1950,
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = catalog_path,
+        .snapshot_root_dir = snapshot_root,
+    };
+    {
+        var server = try Server.init(std.testing.allocator, cfg);
+        defer server.deinit();
+        try server.start();
+        try server.bootstrapLocal(cfg.metadata_group_id, cfg.local_node_id);
+    }
+    const foreign_record: antfly.raft.catalog.ReplicaRecord = .{
+        .group_id = 1951,
+        .replica_id = 1,
+        .local_node_id = cfg.local_node_id,
+        .bootstrap_mode = .empty,
+    };
+    {
+        // Simulate a catalog polluted by an older metadata process. Startup
+        // restores the catalog before any placement reconciliation can run.
+        var catalog = try antfly.raft.storage.FileReplicaCatalog.init(std.testing.allocator, catalog_path);
+        defer catalog.deinit();
+        try catalog.catalog().upsertReplica(foreign_record);
+    }
+    var restarted = try Server.init(std.testing.allocator, cfg);
+    defer restarted.deinit();
+    const svc = restarted.metadataHttpService();
+    try std.testing.expectEqual(.active, svc.raft.host.status(cfg.metadata_group_id));
+    try std.testing.expectEqual(.absent, svc.raft.host.status(foreign_record.group_id));
+    try std.testing.expectEqual(@as(usize, 1), svc.raft.host.http_host.transport_stack.transport_host.served_groups.count());
+    // Recovery ignores foreign ownership without deleting retained state.
+    try std.testing.expect(svc.raft.host.http_host.host.replicaCatalogContains(foreign_record.group_id).?);
+    try std.testing.expectError(error.ReplicaAdmissionRejected, svc.raft.host.http_host.host.ensureReplica(foreign_record));
+    try restarted.start();
+    try restarted.bootstrapLocal(cfg.metadata_group_id, cfg.local_node_id);
+    for (0..8) |_| try restarted.runRound();
+    try std.testing.expect(svc.reconcileLeaseStats().held_by_local);
+    try std.testing.expectEqual(.absent, svc.raft.host.status(foreign_record.group_id));
 }
 
 test "metadata runtime bootstrapLocal skips local replica-root reconcile on the bootstrap round" {

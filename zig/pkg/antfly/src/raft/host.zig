@@ -755,7 +755,9 @@ pub const Host = struct {
         return restored;
     }
 
-    fn acceptsReplicaRecord(self: *const Host, record: catalog.ReplicaRecord) bool {
+    /// Placement selection must use the same ownership policy as admission
+    /// and catalog recovery; numeric node identity alone is not sufficient.
+    pub fn acceptsReplicaRecord(self: *const Host, record: catalog.ReplicaRecord) bool {
         const factory = self.deps.descriptor_factory orelse return true;
         return factory.acceptsRecord(record);
     }

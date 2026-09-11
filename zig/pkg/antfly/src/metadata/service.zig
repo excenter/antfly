@@ -5880,6 +5880,7 @@ pub const MetadataService = struct {
         const local_node_id = self.raft.host.host.cfg.local_node_id;
         for (projected) |intent| {
             if (intent.record.local_node_id != local_node_id) continue;
+            if (!self.raft.host.host.acceptsReplicaRecord(intent.record)) continue;
             try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
@@ -9843,6 +9844,7 @@ pub const MetadataHttpService = struct {
 
         for (inputs.placement_intents) |intent| {
             if (intent.record.local_node_id != self.raft.host.http_host.host.cfg.local_node_id) continue;
+            if (!self.raft.host.http_host.host.acceptsReplicaRecord(intent.record)) continue;
             try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
@@ -19089,4 +19091,124 @@ test "metadata service local replica root reconcile permit hook defers reconcile
     svc.last_local_table_provisioning_refresh_at_ms = 0;
     try runServiceRounds(&svc, 8);
     try std.testing.expect(svc.local_table_provisioning_fingerprint != null);
+}
+
+test "metadata service excludes colliding data placements rejected by its host" {
+    const Factory = struct {
+        alloc: std.mem.Allocator,
+        store: *raft_engine.core.MemoryStorage,
+        metadata_group_id: u64,
+
+        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .build_descriptor = buildDescriptor,
+                    .free_descriptor = freeDescriptor,
+                    .accepts_record = acceptsRecord,
+                },
+            };
+        }
+
+        fn acceptsRecord(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return record.group_id == self.metadata_group_id;
+        }
+
+        fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &.{record.local_node_id});
+            return .{
+                .group = .{
+                    .group_id = record.group_id,
+                    .local_node_id = record.local_node_id,
+                    .raft_config = .{
+                        .id = record.local_node_id,
+                        .group_id = record.group_id,
+                        .peers = peers,
+                        .election_tick = 5,
+                        .heartbeat_tick = 1,
+                        .pre_vote = false,
+                        .check_quorum = true,
+                    },
+                    .storage = self.store.storage(),
+                },
+                .bootstrap = switch (record.bootstrap_mode) {
+                    .empty => .empty,
+                    .persisted, .fetch_snapshot => .persisted,
+                },
+            };
+        }
+
+        fn freeDescriptor(_: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            alloc.free(desc.group.raft_config.peers);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-placement-admission/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-placement-admission/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store, .metadata_group_id = 2010 };
+    var svc = try MetadataService.init(std.testing.allocator, .{
+        .host = .{
+            .local_node_id = 3,
+            .metadata_group_id = 2010,
+            .replica_root_dir = replica_root,
+            .replica_catalog_path = replica_catalog_path,
+        },
+    }, .{
+        .host = .{
+            .host = .{ .descriptor_factory = factory.iface() },
+        },
+    }, .{});
+    defer svc.deinit();
+
+    _ = try svc.ensureMetadataReplica(.{
+        .group_id = 2010,
+        .replica_id = 3,
+        .local_node_id = 3,
+        .bootstrap_mode = .empty,
+    });
+    try svc.campaignMetadataGroup();
+    try svc.runRound();
+
+    // A valid committed placement for data node 3 must remain available to its
+    // owner even when this metadata process also uses numeric node ID 3.
+    try svc.upsertNode(.{ .node_id = 3 });
+    try svc.upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = true });
+    try svc.runRound();
+    try svc.upsertReplicaIntent(.{
+        .record = .{
+            .group_id = 2011,
+            .replica_id = 3,
+            .local_node_id = 3,
+            .bootstrap_mode = .empty,
+        },
+        .store_id = 3,
+        .peer_node_ids = &.{ 1, 2, 3 },
+    }, null, 0, false);
+    try runServiceRounds(&svc, 8);
+
+    const projected = try svc.listProjectedPlacementIntents(std.testing.allocator);
+    defer svc.freeProjectedPlacementIntents(std.testing.allocator, projected);
+    try std.testing.expectEqual(@as(usize, 1), projected.len);
+    try std.testing.expectEqual(@as(u64, 2011), projected[0].record.group_id);
+    try std.testing.expectEqual(@as(u64, 3), projected[0].store_id);
+
+    // Prove the absence is the result of completed, lease-authorized local
+    // reconciliation, not an uncommitted placement or an early-returning loop.
+    const lease = svc.reconcileLeaseStats();
+    try std.testing.expect(lease.enabled);
+    try std.testing.expect(lease.held_by_local);
+    try std.testing.expectEqual(@as(u64, 3), lease.owner_node_id);
+    try std.testing.expectEqual(svc.placement_epoch.load(.monotonic), svc.local_placement_epoch.?);
+    try std.testing.expectEqual(raft_host.HostedReplicaStatus.active, svc.raft.host.status(2010));
+    try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, svc.raft.host.status(2011));
+    try std.testing.expect(!svc.raft.host.host.replicaCatalogContains(2011).?);
 }
